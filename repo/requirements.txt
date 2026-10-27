@@ -1,0 +1,12 @@
+# 论文写作助手 · 工程版依赖
+# pip install -r requirements.txt
+
+# 读 .xlsx（CSMAR 导出常用格式）
+openpyxl>=3.1.0
+
+# HTTPS 根证书。Windows 上的 Python 常缺系统根证书，
+# 不装会报 CERTIFICATE_VERIFY_FAILED，只能用 --skip-verify 临时绕过
+certifi>=2023.0.0
+
+# 其余全部使用标准库：urllib、csv、json、xml.etree、ssl、unittest
+# 不需要 requests、pandas、beautifulsoup4
