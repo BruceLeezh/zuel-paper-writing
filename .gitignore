@@ -1,8 +1,35 @@
+# ── Python ─────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
 venv/
+*.egg-info/
+build/
+dist/
+
+# ── 本地环境与凭据（一律不入库）────────────────────────
+# 本项目运行不需要任何密钥；下面的规则是为了防止日后误提交
+.env
+.env.*
+*.key
+*.pem
+secrets.*
+config.local.*
+*_local.py
+
+# ── 编辑器与系统 ──────────────────────────────────────
+.idea/
+.vscode/
+*.swp
 *.log
 .DS_Store
 Thumbs.db
+
+# ── 用户数据（导入解析的原始导出件，含个人或数据库内容）──
+# 需要复现时用 tests/fixtures 下的合成样例
+*.docx
+*.xlsx
+*.xls
+*.csv
+!repo/tests/fixtures/*.csv

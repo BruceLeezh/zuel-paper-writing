@@ -19,6 +19,7 @@ from .model import Item
 # 但必须过 _printable_ratio 检查，否则乱码会被当正常数据往下算。
 _CODECS = ("utf-8-sig", "gb18030", "utf-8", "latin-1")
 _PRINTABLE_MIN = 0.95           # 可打印字符占比下限
+_MAX_CHARS = 32 * 1024 * 1024   # 读入字符上限：题录与面板不需要更大，防大文件拖爆内存
 
 
 def _text_score(text: str) -> float:
@@ -30,6 +31,13 @@ def _text_score(text: str) -> float:
     return ok / len(text)
 
 
+def _too_big(n: int) -> ValueError:
+    return ValueError(
+        f"文件超过 {_MAX_CHARS // 1024 // 1024}M 字符读取上限。"
+        f"题录与面板导出远用不到这个量级；如果确实是导出文件，"
+        f"请按年份或字段拆分后再导入")
+
+
 def _text(path: str) -> tuple[str, str]:
     """读文本，返回 (内容, 实际编码)。
 
@@ -39,9 +47,11 @@ def _text(path: str) -> tuple[str, str]:
     for c in _CODECS:
         try:
             with io.open(path, "r", encoding=c) as f:
-                text = f.read()
+                text = f.read(_MAX_CHARS + 1)
         except UnicodeDecodeError:
             continue
+        if len(text) > _MAX_CHARS:
+            raise _too_big(len(text))
         if "\x00" in text or _text_score(text) < _PRINTABLE_MIN:
             raise ValueError(
                 f"编码识别失败：用 {c} 解出的内容中可打印字符不足 "
@@ -80,15 +90,18 @@ def _blocks(text: str) -> list[str]:
 
 def _from_endnote(text: str, src: str) -> list[Item]:
     out = []
-    for blk in _blocks(text):
+    for blk in _blocks(re.sub(r"(?m)^(?=%0 |RT )", "\n", text)):
         f: dict[str, list[str]] = {}
         for ln in blk.splitlines():
             m = re.match(r"^%([A-Z0-9@])\s+(.*)$", ln.strip())
             if m:
                 f.setdefault(m.group(1), []).append(m.group(2).strip())
-        if not f.get("T"):
+        unknown = [ln for ln in blk.splitlines() if ln.strip() and not re.match('^%([A-Z0-9@])\\s+(.*)$', ln.strip())]
+        if unknown:
+            out.append(Item(src=src, field="literature", title="[未能解析的条目]", raw={"unparsed": unknown}))
+        if not f:
             continue
-        out.append(Item(src=src, field="literature", title=f["T"][0],
+        out.append(Item(src=src, field="literature", title=(f.get("T") or [""])[0],
                         people=f.get("A", []),
                         when=(f.get("D") or [""])[0],
                         ident=(f.get("R") or [""])[0],
@@ -104,15 +117,18 @@ def _from_endnote(text: str, src: str) -> list[Item]:
 
 def _from_refworks(text: str, src: str) -> list[Item]:
     out = []
-    for blk in _blocks(text):
+    for blk in _blocks(re.sub(r"(?m)^(?=%0 |RT )", "\n", text)):
         f: dict[str, list[str]] = {}
         for ln in blk.splitlines():
             m = re.match(r"^([A-Z][A-Z0-9])\s+(.*)$", ln.strip())
             if m:
                 f.setdefault(m.group(1), []).append(m.group(2).strip())
-        if not f.get("T1"):
+        unknown = [ln for ln in blk.splitlines() if ln.strip() and not re.match('^([A-Z][A-Z0-9])\\s+(.*)$', ln.strip())]
+        if unknown:
+            out.append(Item(src=src, field="literature", title="[未能解析的条目]", raw={"unparsed": unknown}))
+        if not f:
             continue
-        out.append(Item(src=src, field="literature", title=f["T1"][0],
+        out.append(Item(src=src, field="literature", title=(f.get("T1") or [""])[0],
                         people=f.get("A1", []),
                         when=(f.get("YR") or [""])[0],
                         ident=(f.get("DO") or [""])[0],
@@ -202,6 +218,9 @@ def _from_gbt(text: str, src: str) -> list[Item]:
 def read_export(path: str, kind: str = "auto", src: str = "cnki") -> tuple[list[Item], str]:
     """读题录导出文件，返回 (条目列表, 识别到的格式)。"""
     text, _ = _text(path)
+    if not text.strip():
+        # 空文件落到「认不出格式」会把用户往格式问题上带；先说清真正的原因。
+        raise ValueError("文件是空的，没有题录可解析")
     fmt = sniff_kind(text) if kind == "auto" else kind
     if fmt == "endnote":
         return _from_endnote(text, src), fmt
@@ -248,7 +267,12 @@ def _rows_from_csv(path: str, codec: str) -> list[list[str]]:
             d = csv.Sniffer().sniff(sample, delimiters=",\t;|") if sample else csv.excel
         except csv.Error:
             d = csv.excel
-        return [r for r in csv.reader(f, d)]
+        rows = []
+        for i, r in enumerate(csv.reader(f, d)):
+            if i > _MAX_CHARS // 8:            # 常规行宽下也到不了字符上限，这里兜底防构造行
+                raise _too_big(_MAX_CHARS)
+            rows.append(r)
+        return rows
 
 
 def _read_rows(path: str) -> tuple[list[list[str]], str]:
@@ -290,10 +314,13 @@ def _rows_from_xlsx(path: str) -> list[list[str]]:
             f"读不了 .xlsx（{type(exc).__name__}: {exc}）。"
             f"文件可能不是真正的 Excel 或已损坏，请在 WPS 里另存为 .xlsx / .csv 后重试"
         ) from exc
-    ws = wb.active
-    rows = [["" if c is None else str(c) for c in r] for r in ws.iter_rows(values_only=True)]
-    wb.close()
-    return rows
+    try:
+        ws = wb.active
+        if ws is None:
+            raise ValueError("工作簿没有可读取的工作表")
+        return [["" if c is None else str(c) for c in r] for r in ws.iter_rows(values_only=True)]
+    finally:
+        wb.close()
 
 
 def _find_header(rows: list[list[str]]) -> int:
@@ -320,8 +347,12 @@ def read_panel(path: str) -> dict:
     head = [c.strip() for c in rows[h]]
     if not any(head):
         raise ValueError("没找到表头行，请确认导出文件是否完整")
+    if any(not c for c in head) or len({c.casefold() for c in head}) != len(head):
+        raise ValueError("表头有空列名或重复列名，请修正后重试")
     body = [r for r in rows[h + 1:]
             if any(str(c).strip() for c in r) and not _is_desc_row(r, head)]
+    if any(len(r) > len(head) and any(str(c).strip() for c in r[len(head):]) for r in body):
+        raise ValueError("数据行包含超出表头的非空字段，请检查分隔符或导出格式")
     return {"head": head, "body": body, "codec": codec}
 
 
@@ -329,8 +360,9 @@ def _is_desc_row(row: list[str], head: list[str]) -> bool:
     """CSMAR 表头下一行常是字段中文名（"证券代码,统计截止日期,报表类型…"）。
 
     它没有数字，也不该计入观测数或报表类型分布。判定条件收得很紧：
-    整行不含数字，且至少一半单元格是中文/非 ASCII，或与字段中文名对得上。
-    真实数据行里代码、日期、数值必带数字，不会被误删。
+    整行不含数字，且大部分单元格与表头行（或已知字段中文名）对得上——
+    说明行是表头的中文回显，逐列对应；对不上表头的一律当数据行保留，
+    「北京／制造业」这类真实的中文取值不能被误删。
     """
     vals = [str(c).strip() for c in row]
     filled = [v for v in vals if v]
@@ -338,12 +370,23 @@ def _is_desc_row(row: list[str], head: list[str]) -> bool:
         return False
     if any(re.search(r"\d", v) for v in filled):
         return False
-    zh = set(FIELD_ZH.values())
-    same = sum(1 for v in filled if v in zh)
-    if same >= max(1, len(filled) - 1):
-        return True
-    nonascii = sum(1 for v in filled if not v.isascii())
-    return nonascii * 2 >= len(filled)
+    # 说明行是「表头行的中文翻译」，逐列对应：与表头同列的值要么是已知
+    # 字段中文名，要么与表头格本身相近（表头是字段代码、说明行是中文名）。
+    # 没有表头对照时（head 为空，单测直调），退回「逐值命中已知字段名」。
+    known = set(FIELD_ZH.values())
+    head_cells = {str(c).strip() for c in head if str(c).strip()}
+    hits = sum(1 for i, v in enumerate(vals) if v and (v in known or i < len(head) and v != vals[i] and v in known))
+    if head_cells:
+        paired = 0
+        for i, v in enumerate(vals):
+            if not v or i >= len(head):
+                continue
+            h = head[i]
+            if v == h or v in known or h in known:
+                paired += 1
+        return paired >= max(1, len(filled) - 1)
+    same = sum(1 for v in filled if v in known)
+    return same >= max(1, len(filled) - 1)
 
 
 def _col(head: list[str], name: str) -> int:
@@ -358,12 +401,13 @@ def _col(head: list[str], name: str) -> int:
     return -1
 
 
-def profile(head: list[str], body: list[str]) -> dict:
+def profile(head: list[str], body: list[list[str]]) -> dict:
     """数据画像：所有数字都出自文件本身，不做推断。"""
     n = len(body)
+    missing_tokens = {"", "na", "n/a", "nan", "null", "none", "--", "."}
     miss = {}
     for i, h in enumerate(head):
-        blank = sum(1 for r in body if i >= len(r) or not str(r[i]).strip())
+        blank = sum(1 for r in body if i >= len(r) or str(r[i]).strip().casefold() in missing_tokens)
         miss[h] = round(blank / n * 100, 2) if n else 0.0
 
     # 报表类型分布：CSMAR 默认导出里 Typrep 常同时含 A（合并）与 B（母公司），
@@ -407,7 +451,22 @@ def profile(head: list[str], body: list[str]) -> dict:
         else:
             seen.add(k)
 
-    return {"rows": n, "cols": len(head), "missing": miss, "span": span,
+    key_indices = []
+    for candidates in (("Stkcd", "Symbol"), ("Accper", "Enddt", "Statco", "Trddt", "year", "date")):
+        found = next((_col(head, c) for c in candidates if _col(head, c) >= 0), -1)
+        if found >= 0:
+            key_indices.append(found)
+    conflicts = 0
+    if len(key_indices) == 2:
+        if _col(head, "Typrep") >= 0:
+            key_indices.append(_col(head, "Typrep"))
+        keys = set()
+        for row in body:
+            key = tuple(str(row[i]).strip() if i < len(row) else "" for i in key_indices)
+            if all(key):
+                conflicts += key in keys
+                keys.add(key)
+    return {"key_columns": [head[i] for i in key_indices] if len(key_indices) >= 2 else [], "key_duplicates": conflicts, "rows": n, "cols": len(head), "missing": miss, "span": span,
             "entities": ent, "dup": dup, "report_type": rep,
             "thin": {k: v for k, v in miss.items() if v >= 30}}
 
@@ -459,9 +518,11 @@ def describe(prof: dict, src_note: str = "CSMAR") -> str:
     warn = ""
     if prof["thin"]:
         items = "、".join(f"{k}（{v}%）" for k, v in prof["thin"].items())
-        warn = f"\n\n注意：{items} 缺失率超过 30%。先确认是数据结构如此，还是导出时漏选。"
+        warn = f"\n\n注意：{items} 缺失率达到或超过 30%。先确认是数据结构如此，还是导出时漏选。"
     if prof["dup"]:
         warn += f"\n\n文件内有 {prof['dup']} 行完全重复，导入统计软件前先查是不是重复导出。"
+    if prof.get("key_duplicates"):
+        warn += f"\n\n公司-期间-报表类型键重复 {prof['key_duplicates']} 行；请核对口径与合并记录，不自动删除。"
     warn += report_type_warning(prof)
 
     return (f"本文使用{src_note}的原始导出数据，共 {prof['rows']} 条观测、{prof['cols']} 个字段"

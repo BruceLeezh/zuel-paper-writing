@@ -132,10 +132,10 @@ def fetch(url: str, *, head: dict | None = None, body: bytes | None = None,
             handlers.append(urllib.request.HTTPSHandler(context=ctx))
 
     opener = urllib.request.build_opener(*handlers)
-    req = urllib.request.Request(url, headers=headers, data=body)
     attempt = 0
     while True:
         try:
+            req = urllib.request.Request(url, headers=headers, data=body)
             with opener.open(req, timeout=timeout) as resp:
                 buf = resp.read(MAX_BYTES + 1)
                 if len(buf) > MAX_BYTES:
@@ -145,6 +145,7 @@ def fetch(url: str, *, head: dict | None = None, body: bytes | None = None,
         except urllib.error.HTTPError as exc:
             if exc.code in _RETRY_CODES and attempt < _RETRY:
                 attempt += 1
+                _throttle(url, interval)     # 重试也守站点间隔，不因重试打得更密
                 time.sleep(1.2)
                 continue
             tip = TIPS.get(str(exc.code), "")
@@ -156,6 +157,7 @@ def fetch(url: str, *, head: dict | None = None, body: bytes | None = None,
             msg = str(exc)
             if attempt < _RETRY and retryable(msg):
                 attempt += 1
+                _throttle(url, interval)
                 time.sleep(1.2)
                 continue
             tip = next((v for k, v in TIPS.items() if k.lower() in msg.lower()), "")

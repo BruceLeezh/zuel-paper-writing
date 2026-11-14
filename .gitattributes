@@ -1,0 +1,15 @@
+# 统一换行：仓库内一律 LF，避免 Windows 下 CRLF 造成整文件 diff
+* text=auto eol=lf
+
+# 代码与文档显式声明为文本
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.json text eol=lf
+
+# 二进制（本项目当前不含，预留以免日后误判）
+*.docx binary
+*.xlsx binary
+*.zip  binary
+*.pdf  binary
+*.png  binary

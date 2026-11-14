@@ -229,6 +229,8 @@ def arxiv(q: str, limit: int = 10, cat: str = "") -> list[Item]:
 # ── A 级：宏观 ──────────────────────────────────────────────
 
 def worldbank(indicator: str, country: str = "CN", limit: int = 10) -> list[Item]:
+    if not str(indicator).strip() or not str(country).strip():
+        raise ValueError("国家代码与指标代码不能为空")
     # 国家代码与指标代码都要转义：用户可能传 "CN;all" 这类多值写法
     cty_code = urllib.parse.quote(str(country).strip(), safe=";,")
     ind_code = urllib.parse.quote(str(indicator).strip(), safe=".")
@@ -250,12 +252,15 @@ def worldbank(indicator: str, country: str = "CN", limit: int = 10) -> list[Item
                         ident=str(ind.get("id", indicator)),
                         link=f"https://data.worldbank.org/indicator/{ind.get('id', indicator)}",
                         raw={"value": row.get("value"), "country": cty.get("id")}))
+    if not out:
+        raise NetError("返回记录均无有效数值；本次未取得数据，请扩大 --limit 或核对指标")
     return out
 
 
 def worldbank_meta(indicator: str) -> dict:
     """取指标定义，写论文时交代口径要用。"""
-    data = json.loads(fetch(f"https://api.worldbank.org/v2/indicator/{indicator}?format=json"))
+    code = urllib.parse.quote(str(indicator).strip(), safe=".")
+    data = json.loads(fetch(f"https://api.worldbank.org/v2/indicator/{code}?format=json"))
     if isinstance(data, list) and len(data) > 1 and data[1]:
         r = data[1][0]
         return {"id": r.get("id"), "name": r.get("name"),

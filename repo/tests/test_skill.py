@@ -345,6 +345,10 @@ class VerifyTest(unittest.TestCase):
         issues = verify.compare(item, rec)
         self.assertEqual(issues[0]["kind"], "doi_mismatch")
         self.assertEqual(issues[0]["level"], "block")
+        # detail 必须给出双方完整题名（60 字内）与相似度，报错才可复核
+        self.assertIn("Digital Transformation Strategies", issues[0]["detail"])
+        self.assertIn("Quantum Chromodynamics", issues[0]["detail"])
+        self.assertIn("相似度", issues[0]["detail"])
 
     def test_field_diff_volume(self):
         item = self._item(title="Digital Transformation Strategies",
@@ -966,7 +970,8 @@ class RoundFiveFixTest(unittest.TestCase):
         旧版 unittest.main() 在文件中部，其后 8 个类在直跑时永远不执行
         （discover 模式恰好掩盖了这一点）。
         """
-        src = io.open(os.path.abspath(__file__), encoding="utf-8").read()
+        with io.open(os.path.abspath(__file__), encoding="utf-8") as handle:
+            src = handle.read()
         last_class = src.rfind("class ")
         guard = src.find('if __name__ == "__main__":')
         self.assertGreater(guard, last_class,

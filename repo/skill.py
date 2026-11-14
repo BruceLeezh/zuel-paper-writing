@@ -21,8 +21,12 @@ import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# 两个流一起固定为 UTF-8：只设 stdout 的话，没开 PYTHONUTF8 的机器上
+# stderr 仍走本地编码（Windows 常见 cp936），错误消息会与 stdout 编码不一致。
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from zuel import checker, feeds, tables, verify  # noqa: E402
 from zuel.model import Level  # noqa: E402
@@ -52,7 +56,7 @@ def _docx_text(path: str) -> str:
                 xml = fh.read(_MAX_DOCX_XML + 1)
     except FileNotFoundError:
         raise
-    except (zipfile.BadZipFile, KeyError, OSError):
+    except (zipfile.BadZipFile, KeyError, OSError, RuntimeError, NotImplementedError):
         raise SystemExit("[不支持] 打不开 .docx 的正文（不是有效 Word 文件，"
                          "或它是旧的 .doc 改名）。请另存为 .docx 后重试。")
     if len(xml) > _MAX_DOCX_XML:
@@ -60,7 +64,7 @@ def _docx_text(path: str) -> str:
                          " 上限，已中止。")
     # ElementTree 对 DTD 实体展开攻击没有防护；论文正文用不到 DTD，
     # 出现即拒绝，不给恶意文档进解析器的机会。
-    if b"<!DOCTYPE" in xml or b"<!ENTITY" in xml:
+    if b"<!DOCTYPE" in xml.replace(b"\x00", b"") or b"<!ENTITY" in xml.replace(b"\x00", b""):
         raise SystemExit("[不支持] 正文 XML 含 DTD/实体定义，已拒绝解析。")
     try:
         root = ET.fromstring(xml)
@@ -106,11 +110,15 @@ def _read_text(path: str) -> str:
     try:
         # utf-8-sig：WPS/记事本另存常带 BOM，不剥掉的话首行「摘要」永远认不出。
         with open(path, "r", encoding="utf-8-sig") as f:
-            t = f.read()
+            t = f.read(_MAX_DOCX_XML + 1)
+            if len(t) > _MAX_DOCX_XML:
+                raise ValueError("文本超过 32M 字符读取上限")
     except UnicodeDecodeError:
         raise SystemExit("[编码错误] 不是 UTF-8，请另存为 UTF-8 后重试。")
     if "\x00" in t[:2000]:
         raise SystemExit("[不支持] 文件含二进制内容，疑似不是纯文本。")
+    if not t.strip():
+        raise ValueError("空文档：没有可检测的文字")
     return t
 
 
@@ -169,6 +177,8 @@ def _outlet(i) -> str:
 
 
 def cmd_find(a) -> int:
+    if not a.q.strip():
+        raise ValueError("检索词不能为空")
     items = feeds.fetch_items(a.source, a.q, a.limit,
                               mail=a.mail, cat=a.cat, country=a.country)
     if a.json:
@@ -203,7 +213,11 @@ def cmd_quote(a) -> int:
                            f"要稳定取价请改用 --source sina）")
         print(json.dumps(item.as_dict(), ensure_ascii=False, indent=2))
         return 0
-    for i in feeds.sina([a.code]):
+    items = feeds.sina([a.code])
+    if a.json:
+        print(json.dumps([i.as_dict() for i in items], ensure_ascii=False, indent=2))
+        return 0
+    for i in items:
         print(f"{i.title}（{i.ident}）")
         for k, v in i.raw.items():
             print(f"  {k}: {v}")
@@ -214,6 +228,9 @@ def cmd_quote(a) -> int:
 def cmd_macro(a) -> int:
     items = feeds.worldbank(a.indicator, a.country, a.limit)
     meta = feeds.worldbank_meta(a.indicator)
+    if a.json:
+        print(json.dumps({"metadata": meta, "items": [i.as_dict() for i in items]}, ensure_ascii=False, indent=2))
+        return 0
     if meta:
         print(f"指标：{meta.get('name')}")
         if meta.get("def"):
@@ -253,16 +270,22 @@ def cmd_cites(a) -> int:
     return 0
 
 
+def _verify_exit(res, unparsed_lines=0) -> int:
+    if res["failed"] or res.get("truncated") or unparsed_lines or not res["total"]:
+        return 2
+    return 1 if any(r["level"] == "block" for r in res["problems"] + res["selfcheck"]) else 0
+
+
 def cmd_verify(a) -> int:
     items, fmt = tables.read_export(a.file, a.format, a.source)
     # 「未能解析的条目」不是一条文献：不参与核验与自查，只报行数。
     parsed = [i for i in items if "unparsed" not in i.raw]
     res = verify.verify_items(parsed, limit=a.limit)
-    unparsed_lines = len(items) - len(parsed)
+    unparsed_lines = sum(len(i.raw.get("unparsed", [])) for i in items)
     if a.json:
         print(json.dumps({"format": fmt, "unparsed_lines": unparsed_lines, **res},
                          ensure_ascii=False, indent=2))
-        return 1 if any(r["level"] == "block" for r in res["problems"]) else 0
+        return _verify_exit(res, unparsed_lines)
 
     print(f"识别为 {fmt}，共 {res['total']} 条"
           f"{'（另有 ' + str(unparsed_lines) + ' 行未识别，不计入）' if unparsed_lines else ''}")
@@ -277,8 +300,8 @@ def cmd_verify(a) -> int:
     if res["checked"] == 0:
         print("没有可核验的条目——本题录里没有 DOI。")
         print("中文期刊多数不注册 DOI，这种情况只能人工核封面页：作者、年期、页码逐项对。")
-    elif not res["problems"]:
-        print("已核条目未发现字段冲突。")
+    elif res["ok"] and not res["problems"]:
+        print(f"{res['ok']} 条已核条目未发现字段冲突（仅元数据比对，不代表原文真实性）。")
     else:
         mark = {"block": "必查", "warn": "存疑"}
         for row in res["problems"]:
@@ -299,12 +322,26 @@ def cmd_verify(a) -> int:
     unverified = res["skipped"] + res["not_doi"]
     if unverified:
         print(f"\n注意：{unverified} 条没有 DOI，本工具核不了，不等于没问题。")
-    return 1 if any(r["level"] == "block" for r in res["problems"]) else 0
+    return _verify_exit(res, unparsed_lines)
 
 
 def cmd_panel(a) -> int:
     data = tables.read_panel(a.file)
+    if not data["body"]:
+        # 只有表头时画像会输出「0 行观测」，看起来像一份合法结果，其实是空导出。
+        raise ValueError("表头后没有数据行：文件可能只导出了字段名或字段说明。"
+                         "请重新导出包含数据的内容后再画像")
+    input_rows = len(data["body"])
+    report_type = getattr(a, "report_type", "")
+    if report_type:
+        idx = tables._col(data["head"], "Typrep")
+        if idx < 0:
+            raise ValueError("没有报表类型列，无法筛选")
+        data["body"] = [r for r in data["body"] if idx < len(r) and str(r[idx]).strip() == report_type]
+        if not data["body"]:
+            raise ValueError("筛选后没有观测，请检查报表类型")
     prof = tables.profile(data["head"], data["body"])
+    prof["selection"] = {"report_type": report_type or None, "input_rows": input_rows, "kept_rows": len(data["body"])}
     if a.json:
         print(json.dumps({"codec": data["codec"], "profile": prof,
                           "fields": [{"code": c, "zh": z}
@@ -313,6 +350,8 @@ def cmd_panel(a) -> int:
                          ensure_ascii=False, indent=2))
         return 0
     print(f"文件：{a.file}\n编码：{data['codec']}")
+    if report_type:
+        print(f"报表筛选：保留 {report_type}，{input_rows} → {len(data['body'])} 行（原文件未修改）")
     print(f"观测：{prof['rows']} 行 × {prof['cols']} 列")
     for k, v in prof["span"].items():
         print(f"时间：{k} 覆盖 {v['min']}—{v['max']}（{v['years']} 个年度）")
@@ -401,6 +440,7 @@ def main() -> int:
 
     s = sub.add_parser("panel", parents=[net], help="CSMAR 数据画像")
     s.add_argument("file")
+    s.add_argument("--report-type", choices=["A", "B"], default="", help="仅在内存中保留指定报表类型")
     s.set_defaults(func=cmd_panel)
 
     a = p.parse_args()
@@ -409,6 +449,9 @@ def main() -> int:
     _net.DEFAULTS["skip_verify"] = getattr(a, "skip_verify", False)
     try:
         return a.func(a)
+    except SystemExit as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     except FileNotFoundError as exc:
         print(f"[出错] 文件不存在：{exc.filename}", file=sys.stderr)
         return 2
@@ -418,7 +461,7 @@ def main() -> int:
     except OSError as exc:
         print(f"[出错] 读不了文件：{exc}", file=sys.stderr)
         return 2
-    except (NetError, ValueError, KeyError) as exc:
+    except (NetError, ValueError, KeyError, TypeError, AttributeError, IndexError, ET.ParseError, zipfile.BadZipFile) as exc:
         print(f"[出错] {exc}", file=sys.stderr)
         return 2
 

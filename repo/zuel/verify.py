@@ -81,13 +81,17 @@ def lookup(doi: str, timeout: float = 12.0) -> dict | None:
         msg = str(exc)
         # 只认以「HTTP 404：」开头的错误。用子串匹配会把 URL 或 DOI 里
         # 恰好含 "404" 的 429/超时误判成「查无此 DOI」，凭空报必改。
-        if re.match(r"^HTTP 404[：:]", msg) or "404 Not Found" in msg:
+        if re.match(r"^HTTP 404[：:]", msg) or re.match(r"^404 Not Found(?:$|:)", msg):
             return None
         raise
     try:
-        return json.loads(raw).get("message") or {}
-    except json.JSONDecodeError:
-        return None
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise net.NetError("Crossref 返回无效 JSON；未完成核验") from exc
+    record = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(record, dict) or not isinstance(record.get("title"), list) or not record["title"] or not isinstance(record["title"][0], str) or not record["title"][0].strip():
+        raise net.NetError("Crossref 响应缺少有效题名；未完成核验")
+    return record
 
 
 _DOI_SHAPE = re.compile(r"^10\.\d{4,9}/\S+$")
@@ -112,7 +116,10 @@ def compare(item: Item, record: dict) -> list[dict]:
         issues.append({
             "kind": "doi_mismatch", "level": "block",
             "what": "DOI 指向另一篇论文",
-            "detail": f"条目题名「{item.title[:40]}」／注册题名「{ct[:40]}」",
+            # 截断长度给到 60：AER 这类带副标题的题名，40 字符时两个版本
+            # 看起来一模一样，用户无从判断报得对不对；相似度一起给出，可复核。
+            "detail": f"条目题名「{item.title[:60]}」／注册题名「{ct[:60]}」"
+                      f"（相似度 {score:.2f}，低于 {_BLOCK:.2f} 阈值）",
             "how": "核对 DOI 是否抄错；确认后改 DOI，或换成该文真实 DOI",
         })
         return issues          # 题名都对不上，后面的字段比较没有意义
@@ -126,12 +133,18 @@ def compare(item: Item, record: dict) -> list[dict]:
     mine = [p for p in item.people if p]
     if reg_family and mine:
         # 题录里常是「名 姓」全写，注册记录只存姓，所以按“我的写法里是否含该姓”配对，
-        # 再比较配出来的顺序，而不是直接比字符串。
+        # 再比较配出来的顺序，而不是直接比字符串。西文复姓（Van der Berg）是多个
+        # token，按「包含在整串里」判；单 token 姓仍按词匹配，避免子串误配
+        # （「Ma」in「Mary」会把两个人的姓配成一人）。
         matched: list[str] = []
+        remaining = list(reg_family)
         for who in mine:
             norm = _norm(who)
-            hit = next((f for f in reg_family if f and f in norm), "")
+            hit = next((f for f in remaining if f and (f in norm if (_CJK.search(f) or " " in f)
+                                                      else f in norm.split())), "")
             matched.append(hit)
+            if hit:
+                remaining.remove(hit)
         paired = len([m for m in matched if m]) == len(reg_family) == len(mine)
         if not paired:
             issues.append({
@@ -241,6 +254,8 @@ def completeness(items: list[Item], *, today: date | None = None) -> list[dict]:
 def verify_items(items: list[Item], *, limit: int = 50,
                  timeout: float = 12.0) -> dict:
     """批量核验。返回统计与问题清单，不抛异常（单条失败只记账）。"""
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError("limit 必须为正整数")
     checked, skipped, not_doi, failed = 0, 0, 0, []
     rows: list[dict] = []
     doi_total = sum(1 for it in items if _normalize_doi(it.ident))
@@ -253,7 +268,7 @@ def verify_items(items: list[Item], *, limit: int = 50,
                 skipped += 1
             continue
         if checked >= limit:
-            break
+            continue
         checked += 1
         try:
             rec = lookup(doi, timeout=timeout)
@@ -271,7 +286,11 @@ def verify_items(items: list[Item], *, limit: int = 50,
                 }],
             })
             continue
-        issues = compare(it, rec)
+        try:
+            issues = compare(it, rec)
+        except (TypeError, AttributeError, KeyError, IndexError, ValueError) as exc:
+            failed.append({"title": it.title[:40], "doi": doi, "reason": "注册记录格式异常：" + str(exc)[:60]})
+            continue
         if issues:
             rows.append({"title": it.title, "doi": doi,
                          "kind": issues[0]["kind"], "level": issues[0]["level"],
